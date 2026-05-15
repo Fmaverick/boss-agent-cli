@@ -119,6 +119,27 @@ def test_request_retries_after_stoken_expired_code(mock_http_client_cls, mock_sl
 	assert second.calls[0]["kwargs"]["params"]["__zp_stoken__"] == "refreshed-1"
 
 
+@patch("boss_agent_cli.api.client.random.uniform", return_value=0)
+@patch("boss_agent_cli.api.client.time.sleep")
+@patch("boss_agent_cli.api.client.httpx.Client")
+def test_request_does_not_mutate_original_get_params_across_retries(mock_http_client_cls, mock_sleep, mock_uniform):
+	auth = FakeAuthManager()
+	first = FakeHttpxClient([FakeResponse(payload={"code": endpoints.CODE_STOKEN_EXPIRED})])
+	second = FakeHttpxClient([FakeResponse(payload={"code": 0, "zpData": {"ok": True}})])
+	mock_http_client_cls.side_effect = [first, second]
+	original_params = {"encryptJobId": "job-1"}
+
+	client = BossClient(auth)
+	client._throttle.wait = lambda: None
+	client._throttle.mark = lambda: None
+
+	client._request("GET", endpoints.DETAIL_URL, params=original_params)
+
+	assert original_params == {"encryptJobId": "job-1"}
+	assert first.calls[0]["kwargs"]["params"]["__zp_stoken__"] == "initial-stoken"
+	assert second.calls[0]["kwargs"]["params"]["__zp_stoken__"] == "refreshed-1"
+
+
 @patch("boss_agent_cli.api.client.time.sleep")
 @patch("boss_agent_cli.api.client.httpx.Client")
 def test_request_retries_after_rate_limited_code(mock_http_client_cls, mock_sleep):

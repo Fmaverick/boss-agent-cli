@@ -92,6 +92,7 @@ _CANDIDATE_COMMANDS = {
 	"apply",
 	"shortlist",
 	"digest",
+	"market",
 	"stats",
 	"resume",
 	"ai",
@@ -226,7 +227,7 @@ def _format_mcp_tools(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 SCHEMA_DATA = {
 	"name": "boss-agent-cli",
-	"description": "BOSS直聘求职工具。34 个顶层命令覆盖搜索、筛选、打招呼、沟通、流水线、招聘者工作流与简历优化全流程。",
+	"description": "BOSS直聘求职工具。35 个顶层命令覆盖搜索、筛选、市场扫描、打招呼、沟通、流水线、招聘者工作流与简历优化全流程。",
 	"commands": {
 		"login": {
 			"description": "按当前平台登录（zhipin: Cookie 提取 → CDP → QR httpx → patchright；zhilian: Cookie 提取 → CDP → 浏览器登录）",
@@ -362,6 +363,59 @@ SCHEMA_DATA = {
 					"type": "bool",
 					"default": False,
 					"description": "跳过缓存，强制请求接口",
+				},
+			},
+		},
+		"market": {
+			"description": "面向特定求职目标做岗位市场扫描。ai-pm 子命令默认扫描杭州/上海 AI 产品经理序列，汇总职位、代表性 JD 与共性要求",
+			"args": [],
+			"options": {},
+			"subcommands": {
+				"ai-pm": {
+					"description": "扫描杭州/上海 AI/AIGC/大模型/智能体产品经理岗位，过滤非产品经理序列，并提炼 JD 共性要求和个人匹配讲法",
+					"args": [],
+					"options": {
+						"--city": {
+							"type": "string",
+							"default": "杭州,上海",
+							"description": "目标城市，可重复传入；默认杭州、上海",
+						},
+						"--query": {
+							"type": "string",
+							"default": None,
+							"description": "自定义搜索关键词，可重复传入；不传则使用 AI/AIGC/大模型/智能体/Agent/AI应用/产品经理",
+						},
+						"--page": {
+							"type": "int",
+							"default": 1,
+							"description": "起始页码",
+						},
+						"--pages": {
+							"type": "int",
+							"default": 1,
+							"description": "每组关键词扫描页数",
+						},
+						"--limit": {
+							"type": "int",
+							"default": 30,
+							"description": "最多输出职位数",
+						},
+						"--detail-limit": {
+							"type": "int",
+							"default": 6,
+							"description": "最多拉取多少个代表性 JD 详情",
+						},
+						"--min-score": {
+							"type": "int",
+							"default": 45,
+							"description": "市场匹配分阈值",
+						},
+						"--no-detail": {
+							"type": "bool",
+							"default": False,
+							"description": "只看列表页，不拉取详情 JD",
+						},
+					},
 				},
 			},
 		},

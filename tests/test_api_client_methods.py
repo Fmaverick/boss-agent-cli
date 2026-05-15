@@ -40,16 +40,18 @@ def test_search_jobs_minimal_params():
 	client = _make_client()
 	client.search_jobs("python")
 	call = client._browser_request.call_args
-	assert call.args == ("GET", endpoints.SEARCH_URL)
-	assert call.kwargs["params"]["query"] == "python"
-	assert call.kwargs["params"]["page"] == 1
+	assert call.args == ("POST", endpoints.SEARCH_URL)
+	assert call.kwargs["data"]["query"] == "python"
+	assert call.kwargs["data"]["page"] == 1
+	assert call.kwargs["data"]["pageSize"] == 15
+	assert call.kwargs["data"]["scene"] == 1
 
 
 def test_search_jobs_with_page():
 	client = _make_client()
 	client.search_jobs("python", page=3)
 	call = client._browser_request.call_args
-	assert call.kwargs["params"]["page"] == 3
+	assert call.kwargs["data"]["page"] == 3
 
 
 def test_search_jobs_all_filter_codes_applied():
@@ -67,7 +69,7 @@ def test_search_jobs_all_filter_codes_applied():
 		stage="A轮",
 		job_type="全职",
 	)
-	params = client._browser_request.call_args.kwargs["params"]
+	params = client._browser_request.call_args.kwargs["data"]
 	assert params["query"] == "python"
 	# 每个映射都应该生成一个 code 字段，code 非空
 	assert params.get("city") is not None
@@ -87,11 +89,11 @@ def test_search_jobs_unknown_city_raises():
 
 
 def test_search_jobs_unknown_salary_does_not_crash():
-	"""未知 salary 不生成 code，但不抛异常（静默跳过）。"""
+	"""未知 salary 保持为空，但不抛异常。"""
 	client = _make_client()
 	client.search_jobs("python", salary="unknown-range")
-	params = client._browser_request.call_args.kwargs["params"]
-	assert "salary" not in params
+	params = client._browser_request.call_args.kwargs["data"]
+	assert params["salary"] == ""
 
 
 def test_recommend_jobs_default_page():
@@ -202,6 +204,36 @@ def test_job_detail_passes_encrypted_job_id():
 	call = client._request.call_args
 	assert call.args == ("GET", endpoints.DETAIL_URL)
 	assert call.kwargs["params"] == {"encryptJobId": "encrypted_j1"}
+
+
+def test_job_detail_falls_back_to_browser_on_code_37():
+	client = _make_client()
+	client._request.return_value = {"code": endpoints.CODE_STOKEN_EXPIRED, "message": "expired", "zpData": {}}
+	client._browser_request.return_value = {"code": 0, "zpData": {"jobInfo": {"jobName": "AI产品经理"}}}
+
+	result = client.job_detail("encrypted_j1")
+
+	assert result["code"] == 0
+	client._browser_request.assert_called_once_with(
+		"GET",
+		endpoints.DETAIL_URL,
+		params={"encryptJobId": "encrypted_j1"},
+	)
+
+
+def test_job_detail_falls_back_to_browser_on_httpx_exception():
+	client = _make_client()
+	client._request.side_effect = RuntimeError("httpx failed")
+	client._browser_request.return_value = {"code": 0, "zpData": {"jobInfo": {"jobName": "AI产品经理"}}}
+
+	result = client.job_detail("encrypted_j1")
+
+	assert result["code"] == 0
+	client._browser_request.assert_called_once_with(
+		"GET",
+		endpoints.DETAIL_URL,
+		params={"encryptJobId": "encrypted_j1"},
+	)
 
 
 def test_user_info_no_params():

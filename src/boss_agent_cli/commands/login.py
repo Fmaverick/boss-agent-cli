@@ -1,5 +1,6 @@
 import click
 
+from boss_agent_cli.auth.browser import sync_token_from_cdp
 from boss_agent_cli.auth.manager import AuthManager
 from boss_agent_cli.display import boss_command_for_ctx, login_action_for_ctx
 from boss_agent_cli.output import emit_error, emit_success
@@ -9,8 +10,9 @@ from boss_agent_cli.output import emit_error, emit_success
 @click.option("--timeout", default=120, help="扫码登录超时时间（秒）")
 @click.option("--cookie-source", default=None, help="指定浏览器提取 Cookie（如 chrome/firefox/edge），不指定则自动检测")
 @click.option("--cdp", is_flag=True, default=False, help="强制 CDP 模式（跳过 Cookie 提取，CDP 不可用直接报错）")
+@click.option("--sync-cdp", is_flag=True, default=False, help="直接从当前已登录的 CDP Chrome 同步登录态，不触发扫码流程")
 @click.pass_context
-def login_cmd(ctx: click.Context, timeout: int, cookie_source: str | None, cdp: bool) -> None:
+def login_cmd(ctx: click.Context, timeout: int, cookie_source: str | None, cdp: bool, sync_cdp: bool) -> None:
 	"""登录当前招聘平台（按平台走对应的 Cookie / CDP / 浏览器降级链路）"""
 	data_dir = ctx.obj["data_dir"]
 	logger = ctx.obj["logger"]
@@ -19,13 +21,19 @@ def login_cmd(ctx: click.Context, timeout: int, cookie_source: str | None, cdp: 
 
 	auth = AuthManager(data_dir, logger=logger, platform=platform_name)
 	try:
-		token = auth.login(
-			timeout=timeout,
-			cookie_source=cookie_source,
-			cdp_url=cdp_url,
-			force_cdp=cdp,
-		)
-		method = token.pop("_method", "未知")
+		if sync_cdp:
+			token = sync_token_from_cdp(cdp_url=cdp_url, platform=platform_name)
+			auth._store.save(token)
+			auth._token = token
+			method = "CDP 会话同步"
+		else:
+			token = auth.login(
+				timeout=timeout,
+				cookie_source=cookie_source,
+				cdp_url=cdp_url,
+				force_cdp=cdp,
+			)
+			method = token.pop("_method", "未知")
 		status_cmd = boss_command_for_ctx(ctx, "status")
 		search_cmd = boss_command_for_ctx(ctx, "search <query>")
 		recommend_cmd = boss_command_for_ctx(ctx, "recommend")

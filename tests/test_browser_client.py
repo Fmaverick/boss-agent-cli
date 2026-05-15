@@ -4,9 +4,11 @@ import httpx
 
 from boss_agent_cli.api.browser_client import (
 	CDP_DEFAULT_URL,
+	_CDP_CONNECT_TIMEOUT_MS,
 	HOME_URL,
 	_HEADLESS_NETWORKIDLE_GRACE_MS,
 	_NAV_TIMEOUT_MS,
+	_SEARCH_RESPONSE_TIMEOUT_MS,
 	BrowserSession,
 )
 
@@ -25,6 +27,11 @@ def test_fetch_ws_url_success():
 		mock_get.return_value = mock_resp
 		ws = BrowserSession._fetch_ws_url("http://127.0.0.1:9222")
 		assert ws == "ws://127.0.0.1:9222/devtools/browser/abc"
+		mock_get.assert_called_once_with(
+			"http://127.0.0.1:9222/json/version",
+			timeout=3,
+			trust_env=False,
+		)
 
 
 def test_fetch_ws_url_failure():
@@ -192,6 +199,26 @@ def test_try_connect_reuses_existing_context():
 	mock_user_context.new_page.assert_called_once()
 
 
+def test_try_connect_reuses_existing_platform_page():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+
+	mock_browser = MagicMock()
+	mock_user_context = MagicMock()
+	mock_existing_page = MagicMock()
+	mock_existing_page.url = "https://www.zhipin.com/shanghai/"
+	mock_user_context.pages = [mock_existing_page]
+	mock_browser.contexts = [mock_user_context]
+
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser
+
+	result = session._try_connect("ws://localhost:9222/test")
+
+	assert result is True
+	assert session._page is mock_existing_page
+	mock_user_context.new_page.assert_not_called()
+
+
 def test_try_connect_creates_new_context_when_none_exists():
 	"""CDP 连接无已存在 context 时创建新 context 并注入 cookies"""
 	session = BrowserSession(cookies={"wt2": "abc"}, user_agent="")
@@ -286,7 +313,7 @@ def test_try_cdp_attempts_http_ws_and_devtools_urls_before_falling_back():
 
 	with (
 		patch.object(session, "_try_connect", return_value=False) as mock_try_connect,
-		patch.object(BrowserSession, "_fetch_ws_url", side_effect=[None, "ws://127.0.0.1:9222/devtools/browser/default"]) as mock_fetch_ws_url,
+		patch.object(BrowserSession, "_fetch_ws_url", side_effect=["ws://127.0.0.1:9333/devtools/browser/custom", "ws://127.0.0.1:9222/devtools/browser/default"]) as mock_fetch_ws_url,
 		patch.object(BrowserSession, "_read_devtools_active_port", return_value="ws://127.0.0.1:9222/devtools/browser/file") as mock_read_port,
 	):
 		result = session._try_cdp()
@@ -294,9 +321,10 @@ def test_try_cdp_attempts_http_ws_and_devtools_urls_before_falling_back():
 	assert result is False
 	mock_read_port.assert_called_once()
 	assert [call.args[0] for call in mock_try_connect.call_args_list] == [
+		"ws://127.0.0.1:9333/devtools/browser/custom",
 		"http://127.0.0.1:9333",
-		CDP_DEFAULT_URL,
 		"ws://127.0.0.1:9222/devtools/browser/default",
+		CDP_DEFAULT_URL,
 		"ws://127.0.0.1:9222/devtools/browser/file",
 	]
 	assert [call.args[0] for call in mock_fetch_ws_url.call_args_list] == [
@@ -305,30 +333,161 @@ def test_try_cdp_attempts_http_ws_and_devtools_urls_before_falling_back():
 	]
 
 
+def test_try_connect_uses_explicit_cdp_timeout():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._pw = MagicMock()
+
+	mock_browser = MagicMock()
+	mock_user_context = MagicMock()
+	mock_user_context.pages = []
+	mock_page = MagicMock()
+	mock_user_context.new_page.return_value = mock_page
+	mock_browser.contexts = [mock_user_context]
+	session._pw.chromium.connect_over_cdp.return_value = mock_browser
+
+	result = session._try_connect("ws://127.0.0.1:9222/devtools/browser/test")
+
+	assert result is True
+	session._pw.chromium.connect_over_cdp.assert_called_once_with(
+		"ws://127.0.0.1:9222/devtools/browser/test",
+		timeout=_CDP_CONNECT_TIMEOUT_MS,
+	)
+
+
 def test_request_returns_browser_evaluation_json_and_marks_throttle():
 	session = BrowserSession(cookies={}, user_agent="")
 	session._started = True
 	session._page = MagicMock()
 	session._throttle = MagicMock()
 	expected = {"code": 0, "zpData": {"jobs": []}}
-	session._page.evaluate.return_value = expected
+	mock_response = MagicMock()
+	mock_response.json.return_value = expected
+	mock_cm = MagicMock()
+	mock_cm.__enter__.return_value = mock_cm
+	mock_cm.__exit__.return_value = False
+	mock_cm.value = mock_response
+	session._page.expect_response.return_value = mock_cm
 
-	result = session.request(
-		"POST",
-		"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
-		params={"query": "python", "page": 1},
-		data={"city": "101020100"},
-	)
+	with patch.object(session, "_search_request_via_raw_cdp", return_value=None):
+		result = session.request(
+			"POST",
+			"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+			data={"query": "python", "page": 1, "city": "101020100", "pageSize": 15, "scene": 1},
+		)
 
 	assert result == expected
 	session._throttle.wait.assert_called_once()
 	session._throttle.mark.assert_called_once()
-	evaluate_script, evaluate_args = session._page.evaluate.call_args.args
-	assert "fetch(fetchUrl, options)" in evaluate_script
-	assert evaluate_args == {
-		"method": "POST",
-		"url": "https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
-		"params": {"query": "python", "page": 1},
-		"data": {"city": "101020100"},
-		"referer": "https://www.zhipin.com/web/geek/job",
-	}
+	session._page.expect_response.assert_called_once()
+	session._page.goto.assert_called_once()
+
+
+def test_request_prefers_raw_cdp_search_before_patchright_attach():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._throttle = MagicMock()
+
+	with (
+		patch.object(session, "_search_request_via_raw_cdp", return_value={"code": 0, "zpData": {"jobList": []}}) as mock_raw_cdp,
+		patch.object(session, "_ensure_started") as mock_ensure_started,
+	):
+		result = session.request(
+			"POST",
+			"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+			data={"query": "AIGC 产品经理", "page": 1, "city": "101020100", "pageSize": 15, "scene": 1},
+		)
+
+	assert result["code"] == 0
+	mock_raw_cdp.assert_called_once()
+	mock_ensure_started.assert_not_called()
+	session._throttle.wait.assert_called_once()
+	session._throttle.mark.assert_called_once()
+
+
+def test_request_prefers_raw_cdp_detail_before_patchright_attach():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._throttle = MagicMock()
+
+	with (
+		patch.object(session, "_detail_request_via_raw_cdp", return_value={"code": 0, "zpData": {"jobInfo": {}}}) as mock_raw_cdp,
+		patch.object(session, "_ensure_started") as mock_ensure_started,
+	):
+		result = session.request(
+			"GET",
+			"https://www.zhipin.com/wapi/zpgeek/job/detail.json",
+			params={"encryptJobId": "encrypted_j1"},
+		)
+
+	assert result["code"] == 0
+	mock_raw_cdp.assert_called_once()
+	mock_ensure_started.assert_not_called()
+	session._throttle.wait.assert_called_once()
+	session._throttle.mark.assert_called_once()
+
+
+def test_search_request_navigates_and_retries_once_on_code_37():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._started = True
+	session._page = MagicMock()
+	mock_response_1 = MagicMock()
+	mock_response_1.json.return_value = {"code": 37, "message": "expired", "zpData": {}}
+	mock_response_2 = MagicMock()
+	mock_response_2.json.return_value = {"code": 0, "message": "Success", "zpData": {"jobList": [{"jobName": "AI产品经理"}]}}
+	mock_cm_1 = MagicMock()
+	mock_cm_1.__enter__.return_value = mock_cm_1
+	mock_cm_1.__exit__.return_value = False
+	mock_cm_1.value = mock_response_1
+	mock_cm_2 = MagicMock()
+	mock_cm_2.__enter__.return_value = mock_cm_2
+	mock_cm_2.__exit__.return_value = False
+	mock_cm_2.value = mock_response_2
+	session._page.expect_response.side_effect = [mock_cm_1, mock_cm_2]
+
+	result = session._search_request(
+		"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+		{"query": "AI 产品经理", "city": "101210100", "page": 1, "pageSize": 15, "scene": 1},
+		"https://www.zhipin.com/web/geek/job",
+	)
+
+	assert result["code"] == 0
+	assert session._page.goto.call_count == 2
+	assert session._page.expect_response.call_count == 2
+
+
+def test_search_request_falls_back_to_in_page_fetch_when_page_response_times_out():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._started = True
+	session._page = MagicMock()
+	session._page.expect_response.side_effect = Exception("Timeout 8000ms exceeded")
+	session._page.evaluate.return_value = {"code": 0, "zpData": {"jobList": [{"jobName": "AIGC产品经理"}]}}
+
+	result = session._search_request(
+		"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+		{"query": "AIGC 产品经理", "city": "101020100", "page": 1, "pageSize": 15, "scene": 1},
+		"https://www.zhipin.com/web/geek/job",
+	)
+
+	assert result["code"] == 0
+	assert session._page.expect_response.call_count == 1
+	session._page.goto.assert_called_once()
+	session._page.evaluate.assert_called_once()
+
+
+def test_search_request_uses_shorter_page_response_timeout():
+	session = BrowserSession(cookies={}, user_agent="")
+	session._started = True
+	session._page = MagicMock()
+	mock_response = MagicMock()
+	mock_response.json.return_value = {"code": 0, "zpData": {"jobList": []}}
+	mock_cm = MagicMock()
+	mock_cm.__enter__.return_value = mock_cm
+	mock_cm.__exit__.return_value = False
+	mock_cm.value = mock_response
+	session._page.expect_response.return_value = mock_cm
+
+	session._search_request(
+		"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+		{"query": "AI 产品经理", "city": "101210100", "page": 1, "pageSize": 15, "scene": 1},
+		"https://www.zhipin.com/web/geek/job",
+	)
+
+	assert session._page.expect_response.call_args.kwargs["timeout"] == _SEARCH_RESPONSE_TIMEOUT_MS

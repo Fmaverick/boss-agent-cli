@@ -200,7 +200,7 @@ def doctor_cmd(ctx: click.Context) -> None:
 		cdp_detail = ws_url or f"CDP 不可用（目标: {cdp_url or _DEFAULT_CDP_URL}）"
 		if ws_url:
 			try:
-				resp = httpx.get(f"{cdp_url or _DEFAULT_CDP_URL}/json/version", timeout=3)
+				resp = httpx.get(f"{cdp_url or _DEFAULT_CDP_URL}/json/version", timeout=3, trust_env=False)
 				meta = resp.json()
 				browser_name = meta.get("Browser") or "unknown-browser"
 				user_agent = meta.get("User-Agent") or "unknown-ua"

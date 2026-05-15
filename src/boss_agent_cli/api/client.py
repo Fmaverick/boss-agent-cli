@@ -111,7 +111,7 @@ class BossClient:
 			stoken = token.get("stoken", "")
 
 			if method == "GET":
-				params = kwargs.get("params", {})
+				params = dict(kwargs.get("params", {}))
 				params["__zp_stoken__"] = stoken
 				kwargs["params"] = params
 
@@ -174,10 +174,27 @@ class BossClient:
 
 	# ── Public API ───────────────────────────────────────────────────
 	# High-risk: search, recommend, greet, job_card → browser channel
-	# Low-risk: status, me, cities, schema, detail → httpx channel
+	# Low-risk: status, me, cities, schema → httpx channel
 
 	def search_jobs(self, query: str, **filters: Any) -> dict[str, Any]:
-		params: dict[str, Any] = {"query": query, "page": filters.get("page", 1)}
+		params: dict[str, Any] = {
+			"query": query,
+			"page": filters.get("page", 1),
+			"pageSize": filters.get("page_size", 15),
+			"expectInfo": "",
+			"multiSubway": "",
+			"multiBusinessDistrict": "",
+			"position": "",
+			"jobType": "",
+			"salary": "",
+			"experience": "",
+			"degree": "",
+			"industry": "",
+			"scale": "",
+			"stage": "",
+			"scene": 1,
+			"encryptExpectId": "",
+		}
 		if city := filters.get("city"):
 			code = endpoints.CITY_CODES.get(city)
 			if code is None:
@@ -211,7 +228,7 @@ class BossClient:
 			code = endpoints.JOB_TYPE_CODES.get(job_type)
 			if code:
 				params["jobType"] = code
-		return self._browser_request("GET", endpoints.SEARCH_URL, params=params)
+		return self._browser_request("POST", endpoints.SEARCH_URL, data=params)
 
 	def recommend_jobs(self, page: int = 1) -> dict[str, Any]:
 		params = {"page": page}
@@ -253,7 +270,13 @@ class BossClient:
 
 	def job_detail(self, job_id: str) -> dict[str, Any]:
 		params = {"encryptJobId": job_id}
-		return self._request("GET", endpoints.DETAIL_URL, params=params)
+		try:
+			result = self._request("GET", endpoints.DETAIL_URL, params=params)
+		except Exception:
+			return self._browser_request("GET", endpoints.DETAIL_URL, params=params)
+		if result.get("code") == endpoints.CODE_STOKEN_EXPIRED:
+			return self._browser_request("GET", endpoints.DETAIL_URL, params=params)
+		return result
 
 	def user_info(self) -> dict[str, Any]:
 		return self._request("GET", endpoints.USER_INFO_URL)
