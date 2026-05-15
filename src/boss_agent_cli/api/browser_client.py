@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from types import TracebackType
 from typing import Any, cast
+from urllib.parse import urlencode
 
 from patchright.sync_api import sync_playwright
 
@@ -20,6 +21,19 @@ from boss_agent_cli.api.throttle import RequestThrottle
 from boss_agent_cli.auth.browser import _DEFAULT_CDP_URL as CDP_DEFAULT_URL
 
 HOME_URL = "https://www.zhipin.com/"
+SEARCH_PAGE_URL = "https://www.zhipin.com/web/geek/jobs"
+
+
+def _pick_existing_platform_page(context: Any) -> Any | None:
+	"""优先复用已存在的 zhipin 页面，避免新建 CDP page 导航时销毁执行上下文。"""
+	for page in context.pages:
+		try:
+			url = page.url or ""
+		except Exception:
+			continue
+		if "zhipin.com" in url:
+			return page
+	return None
 
 
 class RecruiterChatTabRequired(RuntimeError):
@@ -38,8 +52,10 @@ class RecruiterChatTabRequired(RuntimeError):
 
 # 超时常量
 _CDP_PROBE_TIMEOUT = 3           # CDP 探测 HTTP 超时（秒）
+_CDP_CONNECT_TIMEOUT_MS = 5000   # CDP 建连超时（毫秒）
 _NAV_TIMEOUT_MS = 15000          # 页面导航超时（毫秒）
 _HEADLESS_NETWORKIDLE_GRACE_MS = 3000  # headless 预热的额外宽限，避免卡满 30s
+_SEARCH_RESPONSE_TIMEOUT_MS = 8000      # 搜索页真实 joblist 响应等待超时（毫秒）
 
 # macOS / Linux / Windows Chrome user data 默认路径
 _CHROME_USER_DATA_CANDIDATES = [
@@ -123,24 +139,30 @@ class BrowserSession:
 		  2. Default http://localhost:9222 (+ auto WS fallback)
 		  3. WebSocket URL from Chrome's DevToolsActivePort file
 		"""
-		urls_to_try = []
-		if self._cdp_url:
-			urls_to_try.append(self._cdp_url)
-		urls_to_try.append(CDP_DEFAULT_URL)
+		urls_to_try: list[str] = []
+		seen: set[str] = set()
+
+		def add_url(candidate: str | None) -> None:
+			if candidate and candidate not in seen:
+				urls_to_try.append(candidate)
+				seen.add(candidate)
+
+		# 先尝试 WebSocket 端点，避免 connect_over_cdp(http://...) 在部分环境长时间卡住。
+		if self._cdp_url and self._cdp_url.startswith("ws"):
+			add_url(self._cdp_url)
+		elif self._cdp_url:
+			add_url(self._fetch_ws_url(self._cdp_url))
+			add_url(self._cdp_url)
+
+		add_url(self._fetch_ws_url(CDP_DEFAULT_URL))
+		add_url(CDP_DEFAULT_URL)
 
 		# 从 DevToolsActivePort 文件读取 WebSocket URL
-		ws_url = self._read_devtools_active_port()
-		if ws_url:
-			urls_to_try.append(ws_url)
+		add_url(self._read_devtools_active_port())
 
 		for url in urls_to_try:
 			if self._try_connect(url):
 				return True
-			# HTTP URL 连接失败时，尝试从 /json/version 获取 WS URL
-			if url.startswith("http"):
-				ws = self._fetch_ws_url(url)
-				if ws and self._try_connect(ws):
-					return True
 		return False
 
 	def _try_connect(self, url: str) -> bool:
@@ -151,7 +173,7 @@ class BrowserSession:
 		a new context when none exists.
 		"""
 		try:
-			self._browser = self._pw.chromium.connect_over_cdp(url)
+			self._browser = self._pw.chromium.connect_over_cdp(url, timeout=_CDP_CONNECT_TIMEOUT_MS)
 			contexts = self._browser.contexts
 
 			if contexts:
@@ -168,15 +190,19 @@ class BrowserSession:
 					])
 				self._own_context = True
 
-			self._page = self._context.new_page()
-			# CDP 模式下用较长超时 + commit 级等待（避免 networkidle 卡住）
-			try:
-				self._page.goto(HOME_URL, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
-			except Exception:
-				pass  # 即使导航超时，页面 JS 环境已可用
+			reused_page = _pick_existing_platform_page(self._context)
+			if reused_page is not None:
+				self._page = reused_page
+			else:
+				self._page = self._context.new_page()
+				# CDP 模式下用较长超时 + commit 级等待（避免 networkidle 卡住）
+				try:
+					self._page.goto(HOME_URL, wait_until="commit", timeout=_NAV_TIMEOUT_MS)
+				except Exception:
+					pass  # 即使导航超时，页面 JS 环境已可用
 			self._started = True
 			self._is_cdp = True
-			reuse_label = "复用用户 context" if not self._own_context else "新建 context"
+			reuse_label = "复用用户 context + 现有页面" if reused_page is not None else ("复用用户 context" if not self._own_context else "新建 context")
 			self._log(f"[boss] CDP 连接成功 ({url})，{reuse_label}")
 			return True
 		except Exception:
@@ -193,7 +219,7 @@ class BrowserSession:
 		"""Fetch WebSocket debugger URL from Chrome's /json/version endpoint."""
 		import httpx
 		try:
-			resp = httpx.get(f"{http_url}/json/version", timeout=_CDP_PROBE_TIMEOUT)
+			resp = httpx.get(f"{http_url}/json/version", timeout=_CDP_PROBE_TIMEOUT, trust_env=False)
 			payload = resp.json()
 			if not isinstance(payload, dict):
 				return None
@@ -243,30 +269,31 @@ class BrowserSession:
 		self._is_cdp = False
 		self._log("[boss] CDP 不可用（提示：需以 --remote-debugging-port=9222 启动 Chrome），降级到 headless patchright")
 
-	# ── Core request via browser fetch() ─────────────────────────────
+	def _navigate_for_search(self, data: dict[str, Any]) -> None:
+		"""先导航到真实搜索页，建立和前端一致的运行时上下文。"""
+		params: dict[str, Any] = {}
+		if query := data.get("query"):
+			params["query"] = str(query)
+		if city := data.get("city"):
+			params["city"] = str(city)
+		target = SEARCH_PAGE_URL
+		if params:
+			target = f"{target}?{urlencode(params)}"
+		try:
+			self._page.goto(target, wait_until="domcontentloaded", timeout=_NAV_TIMEOUT_MS)
+		except Exception as e:
+			self._log(f"[boss] 搜索页导航未完全完成（{e}），继续尝试页内搜索请求")
 
-	def request(self, method: str, url: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> dict[str, Any]:
-		self._ensure_started()
-		self._throttle.wait()
-
-		referer = endpoints.REFERER_MAP.get(url, f"{endpoints.BASE_URL}/")
-
-		# Bridge 模式：通过扩展 fetch
-		if self._is_bridge and self._bridge_client:
-			import urllib.parse
-			full_url = url
-			if params:
-				full_url = f"{url}?{urllib.parse.urlencode(params)}"
-			result = self._bridge_client.fetch_json(
-				full_url,
-				method=method,
-				data=data,
-				referer=referer,
-			)
-			self._throttle.mark()
-			return cast("dict[str, Any]", result)
-
-		# Playwright 模式（CDP 或 headless）
+	def _fetch_json_in_page(
+		self,
+		method: str,
+		url: str,
+		*,
+		params: dict[str, Any] | None = None,
+		data: dict[str, Any] | None = None,
+		referer: str,
+	) -> dict[str, Any]:
+		"""在当前页面上下文里直接发 fetch 请求并返回 JSON。"""
 		result = self._page.evaluate("""
 			async ({method, url, params, data, referer}) => {
 				try {
@@ -305,7 +332,134 @@ class BrowserSession:
 				}
 			}
 		""", {"method": method, "url": url, "params": params or {}, "data": data, "referer": referer})
+		return cast("dict[str, Any]", result)
 
+	def _cdp_http_url(self) -> str:
+		"""Resolve the CDP HTTP endpoint used by raw websocket helpers."""
+		if self._cdp_url and self._cdp_url.startswith("http"):
+			return self._cdp_url.rstrip("/")
+		return CDP_DEFAULT_URL
+
+	def _search_request_via_raw_cdp(self, url: str, data: dict[str, Any], referer: str) -> dict[str, Any] | None:
+		"""Use a raw CDP temp page for search to avoid patchright CDP attach instability."""
+		cdp_http_url = self._cdp_http_url()
+		if not self._fetch_ws_url(cdp_http_url):
+			return None
+		params: dict[str, str] = {}
+		if query := data.get("query"):
+			params["query"] = str(query)
+		if city := data.get("city"):
+			params["city"] = str(city)
+		search_page_url = SEARCH_PAGE_URL
+		if params:
+			search_page_url = f"{search_page_url}?{urlencode(params)}"
+		return _cdp_fetch_in_temp_page(cdp_http_url, search_page_url, "POST", url, params=None, data=data, referer=referer)
+
+	def _detail_request_via_raw_cdp(self, url: str, params: dict[str, Any], referer: str) -> dict[str, Any] | None:
+		"""Use a raw CDP temp page for detail when httpx stoken refresh fails."""
+		cdp_http_url = self._cdp_http_url()
+		if not self._fetch_ws_url(cdp_http_url):
+			return None
+		job_id = str(params.get("encryptJobId", ""))
+		page_params = {"jid": job_id} if job_id else {}
+		page_url = endpoints.WEB_GEEK_JOB_URL
+		if page_params:
+			page_url = f"{page_url}?{urlencode(page_params)}"
+		return _cdp_fetch_in_temp_page(cdp_http_url, page_url, "GET", url, params=params, data=None, referer=referer)
+
+	def _consume_search_page_response(self, url: str, data: dict[str, Any]) -> dict[str, Any]:
+		"""等待真实搜索页自己发出的 joblist 响应。"""
+		with self._page.expect_response(
+			lambda resp: (
+				resp.request.method == "POST"
+				and url in resp.url
+			),
+			timeout=_SEARCH_RESPONSE_TIMEOUT_MS,
+		) as response_info:
+			self._navigate_for_search(data)
+
+		resp = response_info.value
+		return cast("dict[str, Any]", resp.json())
+
+	def _search_request(self, url: str, data: dict[str, Any], referer: str) -> dict[str, Any]:
+		"""搜索专用请求：优先消费真实页面响应，超时后降级为页内 fetch。"""
+		last_error: Exception | None = None
+		for attempt in range(2):
+			try:
+				result = self._consume_search_page_response(url, data)
+			except Exception as e:
+				last_error = e
+				self._log(f"[boss] 未等到真实搜索页响应（{e}），降级为页内 fetch")
+				try:
+					self._navigate_for_search(data)
+					result = self._fetch_json_in_page("POST", url, data=data, referer=referer)
+				except Exception as fetch_error:
+					last_error = fetch_error
+					if attempt == 0:
+						self._log(f"[boss] 搜索页内 fetch 失败（{fetch_error}），重试一次")
+						continue
+					raise
+			if attempt == 0 and isinstance(result, dict) and result.get("code") == endpoints.CODE_STOKEN_EXPIRED:
+				self._log("[boss] 搜索返回 code 37，重建搜索页上下文后重试一次")
+				continue
+			return cast("dict[str, Any]", result)
+		if last_error is not None:
+			raise last_error
+		return {"code": -1, "message": "search request failed", "zpData": {}}
+
+	# ── Core request via browser fetch() ─────────────────────────────
+
+	def request(self, method: str, url: str, *, params: dict[str, Any] | None = None, data: dict[str, Any] | None = None) -> dict[str, Any]:
+		self._throttle.wait()
+
+		referer = endpoints.REFERER_MAP.get(url, f"{endpoints.BASE_URL}/")
+
+		if method == "POST" and url == endpoints.SEARCH_URL and data:
+			try:
+				raw_cdp_result = self._search_request_via_raw_cdp(url, data, referer)
+			except Exception as e:
+				self._log(f"[boss] 原生 CDP 搜索失败（{e}），回退到浏览器附着链路")
+			else:
+				if raw_cdp_result is not None:
+					self._throttle.mark()
+					return cast("dict[str, Any]", raw_cdp_result)
+
+		if method == "GET" and url == endpoints.DETAIL_URL and params:
+			try:
+				raw_cdp_result = self._detail_request_via_raw_cdp(url, params, referer)
+			except Exception as e:
+				self._log(f"[boss] 原生 CDP 详情失败（{e}），回退到浏览器附着链路")
+			else:
+				if raw_cdp_result is not None:
+					self._throttle.mark()
+					return cast("dict[str, Any]", raw_cdp_result)
+
+		self._ensure_started()
+
+
+		# Bridge 模式：通过扩展 fetch
+		if self._is_bridge and self._bridge_client:
+			import urllib.parse
+			full_url = url
+			if params:
+				full_url = f"{url}?{urllib.parse.urlencode(params)}"
+			result = self._bridge_client.fetch_json(
+				full_url,
+				method=method,
+				data=data,
+				referer=referer,
+			)
+			self._throttle.mark()
+			return cast("dict[str, Any]", result)
+
+		# 搜索接口对页面上下文更敏感：先进入真实搜索页，再发页内请求更稳定。
+		if method == "POST" and url == endpoints.SEARCH_URL and data:
+			result = self._search_request(url, data, referer)
+			self._throttle.mark()
+			return cast("dict[str, Any]", result)
+
+		# Playwright 模式（CDP 或 headless）
+		result = self._fetch_json_in_page(method, url, params=params, data=data, referer=referer)
 		self._throttle.mark()
 		return cast("dict[str, Any]", result)
 
@@ -371,7 +525,12 @@ class BrowserSession:
 
 		if self._is_cdp:
 			# CDP 模式：关闭我们创建的 page 和 context，不关闭用户浏览器
-			if self._page:
+			if self._page and self._own_context:
+				try:
+					self._page.close()
+				except Exception:
+					pass
+			elif self._page and self._context and self._page not in getattr(self._context, "pages", []):
 				try:
 					self._page.close()
 				except Exception:
@@ -580,3 +739,139 @@ def _cdp_evaluate_with_chat_events_in_chat_tab(
 				"bytes": len(bs),
 				"utf8_bits": _carve_utf8_bits(bs)[:10],
 			})
+
+
+def _cdp_fetch_in_temp_page(
+	cdp_http_url: str,
+	page_url: str,
+	method: str,
+	api_url: str,
+	*,
+	params: dict[str, Any] | None,
+	data: dict[str, Any] | None,
+	referer: str,
+) -> dict[str, Any]:
+	"""Open a temporary CDP page, navigate to a same-origin page, then run fetch there."""
+	import json as _json
+	import urllib.request
+
+	import websockets.sync.client as _ws_client
+
+	create_url = cdp_http_url.rstrip("/") + "/json/new?" + page_url
+	close_url_template = cdp_http_url.rstrip("/") + "/json/close/{target_id}"
+	target_id = ""
+	target_ws = ""
+
+	try:
+		req = urllib.request.Request(create_url, method="PUT")
+		with urllib.request.urlopen(req, timeout=5) as resp:
+			payload = _json.load(resp)
+			target_id = cast("str", payload["id"])
+			target_ws = cast("str", payload["webSocketDebuggerUrl"])
+	except Exception as exc:
+		raise RuntimeError(f"cannot create CDP search page: {exc}") from exc
+
+	script = """
+		async ({method, apiUrl, params, data, referer}) => {
+			let fetchUrl = apiUrl;
+			if (params && Object.keys(params).length > 0) {
+				const sp = new URLSearchParams();
+				for (const [k, v] of Object.entries(params)) {
+					if (v !== null && v !== undefined) sp.append(k, String(v));
+				}
+				fetchUrl = apiUrl + '?' + sp.toString();
+			}
+			const options = {
+				method,
+				credentials: 'include',
+				headers: {
+					'Accept': 'application/json, text/plain, */*',
+					'Referer': referer,
+					'X-Requested-With': 'XMLHttpRequest',
+				},
+			};
+			if (method === 'POST' && data) {
+				options.headers['Content-Type'] = 'application/x-www-form-urlencoded';
+				const formData = new URLSearchParams();
+				for (const [k, v] of Object.entries(data)) {
+					if (v !== null && v !== undefined) formData.append(k, String(v));
+				}
+				options.body = formData.toString();
+			}
+			const resp = await fetch(fetchUrl, options);
+			return await resp.json();
+		}
+	"""
+
+	try:
+		with _ws_client.connect(target_ws, max_size=8 * 1024 * 1024) as ws:
+			ws.send(_json.dumps({
+				"id": 1,
+				"method": "Page.enable",
+			}))
+			ws.send(_json.dumps({
+				"id": 2,
+				"method": "Runtime.enable",
+			}))
+			ws.send(_json.dumps({
+				"id": 3,
+				"method": "Page.navigate",
+				"params": {"url": page_url},
+			}))
+
+			deadline = time.time() + 15.0
+			load_fired = False
+			while time.time() < deadline:
+				raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+				msg = _json.loads(raw)
+				if msg.get("method") == "Page.loadEventFired":
+					load_fired = True
+					break
+			if not load_fired:
+				raise RuntimeError("CDP Page.navigate timed out after 15s")
+
+			expression = _build_eval_expression(script, {
+				"method": method,
+				"apiUrl": api_url,
+				"params": params or {},
+				"data": data,
+				"referer": referer,
+			})
+			ws.send(_json.dumps({
+				"id": 4,
+				"method": "Runtime.evaluate",
+				"params": {
+					"expression": expression,
+					"returnByValue": True,
+					"awaitPromise": True,
+				},
+			}))
+
+			eval_deadline = time.time() + 30.0
+			while time.time() < eval_deadline:
+				raw = ws.recv(timeout=max(0.1, eval_deadline - time.time()))
+				msg = _json.loads(raw)
+				if msg.get("id") != 4:
+					continue
+				err = msg.get("error")
+				if err:
+					raise RuntimeError(f"CDP Runtime.evaluate error: {err}")
+				result = msg.get("result", {}).get("result", {})
+				if "value" in result:
+					value = result["value"]
+					return cast("dict[str, Any]", value)
+				exc_details = msg.get("result", {}).get("exceptionDetails")
+				if exc_details:
+					raise RuntimeError(
+						f"JS exception: {exc_details.get('text')} — "
+						f"{exc_details.get('exception', {}).get('description', '')[:300]}"
+					)
+			raise RuntimeError("CDP search evaluate timed out after 30s")
+	finally:
+		if target_id:
+			try:
+				req = urllib.request.Request(close_url_template.format(target_id=target_id), method="GET")
+				with urllib.request.urlopen(req, timeout=5):
+					pass
+			except Exception:
+				pass

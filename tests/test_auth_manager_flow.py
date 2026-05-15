@@ -219,7 +219,24 @@ def test_force_refresh_prefers_cdp_and_persists_new_stoken(
 	store.save.assert_called_once()
 	saved_token = store.save.call_args.args[0]
 	assert saved_token["stoken"] == "new-token"
-	assert manager._token["stoken"] == "new-token"
+	assert saved_token["cookies"]["__zp_stoken__"] == "new-token"
+
+
+@patch("boss_agent_cli.commands.login.sync_token_from_cdp")
+def test_login_sync_cdp_saves_session(mock_sync_cdp, tmp_path):
+	from click.testing import CliRunner
+	from boss_agent_cli.main import cli
+
+	mock_sync_cdp.return_value = {
+		"cookies": {"wt2": "cdp-cookie"},
+		"stoken": "cdp-stoken",
+		"user_agent": "ua",
+	}
+
+	result = CliRunner().invoke(cli, ["--data-dir", str(tmp_path), "login", "--sync-cdp"])
+
+	assert result.exit_code == 0
+	assert '"ok": true' in result.output
 
 
 @patch("boss_agent_cli.auth.manager.TokenStore")

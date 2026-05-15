@@ -174,7 +174,9 @@ class AuthManager:
 						current["cookies"],
 						current.get("user_agent", ""),
 					)
-				refreshed = {**current, "stoken": new_stoken}
+				cookies = dict(current.get("cookies", {}))
+				cookies["__zp_stoken__"] = new_stoken
+				refreshed = {**current, "cookies": cookies, "stoken": new_stoken}
 				self._store.save(refreshed)
 				self._token = refreshed
 			except Exception as e:

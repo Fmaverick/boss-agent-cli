@@ -22,6 +22,7 @@ from boss_agent_cli.commands import (
 	login,
 	logout,
 	mark,
+	market,
 	me,
 	pipeline,
 	preset,
@@ -65,6 +66,7 @@ def register_candidate_commands(cli: click.Group) -> None:
 	cli.add_command(chatmsg.chatmsg_cmd, "chatmsg")
 	cli.add_command(chat_summary.chat_summary_cmd, "chat-summary")
 	cli.add_command(mark.mark_cmd, "mark")
+	cli.add_command(market.market_group, "market")
 	cli.add_command(exchange.exchange_cmd, "exchange")
 	cli.add_command(interviews.interviews_cmd, "interviews")
 	cli.add_command(show.show_cmd, "show")
