@@ -2,7 +2,8 @@
 
 # boss-agent-cli
 
-**专为 AI Agent 设计的 BOSS 直聘双端 CLI 工具**
+**An agent-first CLI for BOSS 直聘 workflows.**  
+**一个围绕 BOSS 直聘工作流设计的 agent-first CLI。**
 
 > 求职者：搜索 · 福利筛选 · 个性化推荐 · 自动打招呼 · 求职流水线 · 增量监控 · AI 简历优化
 >
@@ -33,6 +34,10 @@
 </p>
 
 </div>
+
+> `boss-agent-cli` treats job search and recruiter operations as programmable workflows. Instead of adding AI on top of a traditional tool, it exposes the workflow itself as structured, agent-usable infrastructure.
+>
+> `boss-agent-cli` 的核心思路，不是在传统工具上“加一个 AI 功能”，而是把求职和招聘流程本身变成可编排、可调用、可被 Agent 直接使用的基础设施。
 
 > A CLI tool designed for AI Agents to interact with [BOSS Zhipin](https://www.zhipin.com/) (China's largest recruitment platform). Structured JSON output, schema-driven capability discovery, 4-tier login fallback, recruiter workflow support, and a cross-platform adapter layer. See [README.en.md](README.en.md) for the English version.
 
