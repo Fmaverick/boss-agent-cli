@@ -33,25 +33,25 @@ def _make_client() -> BossClient:
 	return client
 
 
-# ── 高风险通道（浏览器通道）─────────────────────────────────────────────
+# ── 搜索路径──────────────────────────────────────────────────────────
 
 
 def test_search_jobs_minimal_params():
 	client = _make_client()
 	client.search_jobs("python")
-	call = client._browser_request.call_args
-	assert call.args == ("POST", endpoints.SEARCH_URL)
-	assert call.kwargs["data"]["query"] == "python"
-	assert call.kwargs["data"]["page"] == 1
-	assert call.kwargs["data"]["pageSize"] == 15
-	assert call.kwargs["data"]["scene"] == 1
+	call = client._request.call_args
+	assert call.args == ("GET", endpoints.SEARCH_URL)
+	assert call.kwargs["params"]["query"] == "python"
+	assert call.kwargs["params"]["page"] == 1
+	assert call.kwargs["params"]["pageSize"] == 15
+	assert call.kwargs["params"]["scene"] == 1
 
 
 def test_search_jobs_with_page():
 	client = _make_client()
 	client.search_jobs("python", page=3)
-	call = client._browser_request.call_args
-	assert call.kwargs["data"]["page"] == 3
+	call = client._request.call_args
+	assert call.kwargs["params"]["page"] == 3
 
 
 def test_search_jobs_all_filter_codes_applied():
@@ -69,7 +69,7 @@ def test_search_jobs_all_filter_codes_applied():
 		stage="A轮",
 		job_type="全职",
 	)
-	params = client._browser_request.call_args.kwargs["data"]
+	params = client._request.call_args.kwargs["params"]
 	assert params["query"] == "python"
 	# 每个映射都应该生成一个 code 字段，code 非空
 	assert params.get("city") is not None
@@ -92,8 +92,33 @@ def test_search_jobs_unknown_salary_does_not_crash():
 	"""未知 salary 保持为空，但不抛异常。"""
 	client = _make_client()
 	client.search_jobs("python", salary="unknown-range")
-	params = client._browser_request.call_args.kwargs["data"]
+	params = client._request.call_args.kwargs["params"]
 	assert params["salary"] == ""
+
+
+def test_search_jobs_falls_back_to_browser_on_httpx_failure():
+	client = _make_client()
+	client._request.side_effect = RuntimeError("httpx died")
+
+	client.search_jobs("python")
+
+	call = client._browser_request.call_args
+	assert call.args == ("POST", endpoints.SEARCH_URL)
+	assert call.kwargs["data"]["query"] == "python"
+
+
+def test_search_jobs_falls_back_to_browser_on_code_37():
+	client = _make_client()
+	client._request.return_value = {"code": endpoints.CODE_STOKEN_EXPIRED, "message": "expired", "zpData": {}}
+
+	client.search_jobs("python")
+
+	call = client._browser_request.call_args
+	assert call.args == ("POST", endpoints.SEARCH_URL)
+	assert call.kwargs["data"]["query"] == "python"
+
+
+# ── 高风险通道（浏览器通道）─────────────────────────────────────────────
 
 
 def test_recommend_jobs_default_page():

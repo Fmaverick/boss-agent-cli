@@ -173,7 +173,8 @@ class BossClient:
 		return result
 
 	# ── Public API ───────────────────────────────────────────────────
-	# High-risk: search, recommend, greet, job_card → browser channel
+	# High-risk: recommend, greet, job_card → browser channel
+	# Search prefers httpx first because the current endpoint contract is GET.
 	# Low-risk: status, me, cities, schema → httpx channel
 
 	def search_jobs(self, query: str, **filters: Any) -> dict[str, Any]:
@@ -228,7 +229,13 @@ class BossClient:
 			code = endpoints.JOB_TYPE_CODES.get(job_type)
 			if code:
 				params["jobType"] = code
-		return self._browser_request("POST", endpoints.SEARCH_URL, data=params)
+		try:
+			result = self._request("GET", endpoints.SEARCH_URL, params=params)
+		except Exception:
+			return self._browser_request("POST", endpoints.SEARCH_URL, data=params)
+		if result.get("code") == endpoints.CODE_STOKEN_EXPIRED:
+			return self._browser_request("POST", endpoints.SEARCH_URL, data=params)
+		return result
 
 	def recommend_jobs(self, page: int = 1) -> dict[str, Any]:
 		params = {"page": page}
