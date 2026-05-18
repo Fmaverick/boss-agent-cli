@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch, MagicMock
 
 import httpx
@@ -401,6 +402,58 @@ def test_request_prefers_raw_cdp_search_before_patchright_attach():
 	mock_ensure_started.assert_not_called()
 	session._throttle.wait.assert_called_once()
 	session._throttle.mark.assert_called_once()
+
+
+def test_raw_cdp_search_capture_skips_empty_and_code_37_bodies():
+	from boss_agent_cli.api import browser_client
+
+	class FakeWS:
+		def __enter__(self):
+			return self
+
+		def __exit__(self, exc_type, exc, tb):
+			return False
+
+		def send(self, raw):
+			payload = json.loads(raw)
+			if payload.get("method") == "Network.getResponseBody":
+				self._queued_id = payload["id"]
+
+		def recv(self, timeout=None):
+			if hasattr(self, "_queued_id"):
+				msg_id = self._queued_id
+				del self._queued_id
+				if msg_id == 1001:
+					body = ""
+				elif msg_id == 1002:
+					body = '{"code":37,"message":"expired","zpData":{}}'
+				else:
+					body = '{"code":0,"message":"Success","zpData":{"jobList":[{"jobName":"AI 产品经理"}]}}'
+				return json.dumps({"id": msg_id, "result": {"body": body}})
+			self._response_index = getattr(self, "_response_index", 0) + 1
+			return json.dumps({
+				"method": "Network.responseReceived",
+				"params": {
+					"requestId": f"request-{self._response_index}",
+					"response": {"url": "https://www.zhipin.com/wapi/zpgeek/search/joblist.json?_=1"},
+				},
+			})
+
+	with (
+		patch("urllib.request.urlopen") as mock_urlopen,
+		patch("websockets.sync.client.connect", return_value=FakeWS()),
+		patch("json.load", return_value={"id": "target", "webSocketDebuggerUrl": "ws://target"}),
+	):
+		mock_urlopen.return_value.__enter__.return_value = MagicMock()
+		result = browser_client._cdp_capture_search_response(
+			"http://127.0.0.1:9222",
+			"https://www.zhipin.com/web/geek/jobs?query=AI",
+			"https://www.zhipin.com/wapi/zpgeek/search/joblist.json",
+			timeout=1,
+		)
+
+	assert result["code"] == 0
+	assert result["zpData"]["jobList"][0]["jobName"] == "AI 产品经理"
 
 
 def test_request_prefers_raw_cdp_detail_before_patchright_attach():

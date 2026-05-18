@@ -353,7 +353,7 @@ class BrowserSession:
 		search_page_url = SEARCH_PAGE_URL
 		if params:
 			search_page_url = f"{search_page_url}?{urlencode(params)}"
-		return _cdp_fetch_in_temp_page(cdp_http_url, search_page_url, "POST", url, params=None, data=data, referer=referer)
+		return _cdp_capture_search_response(cdp_http_url, search_page_url, url, timeout=30.0)
 
 	def _detail_request_via_raw_cdp(self, url: str, params: dict[str, Any], referer: str) -> dict[str, Any] | None:
 		"""Use a raw CDP temp page for detail when httpx stoken refresh fails."""
@@ -867,6 +867,91 @@ def _cdp_fetch_in_temp_page(
 						f"{exc_details.get('exception', {}).get('description', '')[:300]}"
 					)
 			raise RuntimeError("CDP search evaluate timed out after 30s")
+	finally:
+		if target_id:
+			try:
+				req = urllib.request.Request(close_url_template.format(target_id=target_id), method="GET")
+				with urllib.request.urlopen(req, timeout=5):
+					pass
+			except Exception:
+				pass
+
+
+def _cdp_capture_search_response(
+	cdp_http_url: str,
+	page_url: str,
+	api_url: str,
+	*,
+	timeout: float,
+) -> dict[str, Any]:
+	"""Navigate to the real search page and return its successful joblist response."""
+	import json as _json
+	import urllib.request
+
+	import websockets.sync.client as _ws_client
+
+	create_url = cdp_http_url.rstrip("/") + "/json/new?" + page_url
+	close_url_template = cdp_http_url.rstrip("/") + "/json/close/{target_id}"
+	target_id = ""
+	target_ws = ""
+
+	try:
+		req = urllib.request.Request(create_url, method="PUT")
+		with urllib.request.urlopen(req, timeout=5) as resp:
+			payload = _json.load(resp)
+			target_id = cast("str", payload["id"])
+			target_ws = cast("str", payload["webSocketDebuggerUrl"])
+	except Exception as exc:
+		raise RuntimeError(f"cannot create CDP search page: {exc}") from exc
+
+	try:
+		with _ws_client.connect(target_ws, max_size=16 * 1024 * 1024) as ws:
+			ws.send(_json.dumps({"id": 1, "method": "Page.enable"}))
+			ws.send(_json.dumps({"id": 2, "method": "Network.enable"}))
+			ws.send(_json.dumps({"id": 3, "method": "Page.navigate", "params": {"url": page_url}}))
+
+			pending_response_ids: dict[int, str] = {}
+			next_id = 1000
+			deadline = time.time() + timeout
+			last_response: dict[str, Any] | None = None
+
+			while time.time() < deadline:
+				raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+				msg = _json.loads(raw)
+				msg_id = msg.get("id")
+				if isinstance(msg_id, int) and msg_id in pending_response_ids:
+					request_id = pending_response_ids.pop(msg_id)
+					body = msg.get("result", {}).get("body", "")
+					if not body:
+						continue
+					try:
+						data = _json.loads(body)
+					except ValueError:
+						continue
+					if data.get("code") == endpoints.CODE_SUCCESS:
+						return cast("dict[str, Any]", data)
+					last_response = data if isinstance(data, dict) else last_response
+					continue
+
+				if msg.get("method") != "Network.responseReceived":
+					continue
+				params = msg.get("params", {})
+				response = params.get("response", {})
+				response_url = str(response.get("url", ""))
+				if api_url not in response_url:
+					continue
+				next_id += 1
+				request_id = str(params.get("requestId", ""))
+				pending_response_ids[next_id] = request_id
+				ws.send(_json.dumps({
+					"id": next_id,
+					"method": "Network.getResponseBody",
+					"params": {"requestId": request_id},
+				}))
+
+			if last_response is not None:
+				return last_response
+			raise RuntimeError(f"CDP search response timed out after {timeout:.0f}s")
 	finally:
 		if target_id:
 			try:

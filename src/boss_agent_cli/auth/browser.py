@@ -264,14 +264,130 @@ def sync_token_from_cdp(*, cdp_url: str | None = None, platform: str = "zhipin")
 
 	pw = sync_playwright().start()
 	try:
-		browser = pw.chromium.connect_over_cdp(ws_url)
-		ctx = browser.contexts[0] if browser.contexts else browser.new_context()
-		cookies = ctx.cookies()
-		if not any(c["name"] == success_cookie and cookie_domain in c.get("domain", "") for c in cookies):
-			raise RuntimeError("当前 CDP Chrome 中未检测到已登录会话，请先在该 Chrome 中登录")
-		return _collect_cdp_token(ctx, platform=platform, cookie_domain=cookie_domain)
+		try:
+			browser = pw.chromium.connect_over_cdp(ws_url)
+			ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+			cookies = ctx.cookies()
+			if not any(c["name"] == success_cookie and cookie_domain in c.get("domain", "") for c in cookies):
+				raise RuntimeError("当前 CDP Chrome 中未检测到已登录会话，请先在该 Chrome 中登录")
+			return _collect_cdp_token(ctx, platform=platform, cookie_domain=cookie_domain)
+		except Exception:
+			return _sync_token_from_cdp_raw(cdp_url=cdp_url, platform=platform)
 	finally:
 		pw.stop()
+
+
+def _sync_token_from_cdp_raw(*, cdp_url: str | None = None, platform: str = "zhipin") -> dict[str, Any]:
+	"""通过原生 CDP 提取 cookie，兼容不支持 Browser context management 的 Chrome。"""
+	config = _get_platform_config(platform)
+	cookie_domain = config["cookie_domain"]
+	success_cookie = config["success_cookie"]
+	home_url = config["home_url"]
+
+	expression = """
+		(async () => {
+			const getCookies = async () => {
+				if (globalThis.cookieStore && cookieStore.getAll) {
+					const entries = await cookieStore.getAll();
+					return Object.fromEntries(entries.map((item) => [item.name, item.value]));
+				}
+				return Object.fromEntries(
+					document.cookie.split('; ')
+						.filter(Boolean)
+						.map((item) => {
+							const index = item.indexOf('=');
+							if (index === -1) return [item, ''];
+							return [item.slice(0, index), item.slice(index + 1)];
+						})
+				);
+			};
+			return {
+				cookies: await getCookies(),
+				userAgent: navigator.userAgent,
+			};
+		})()
+	"""
+
+	cdp_http_url, target_id, target_ws = _create_cdp_page(cdp_url, home_url)
+	try:
+		import json
+
+		import websockets.sync.client as ws_client
+
+		with ws_client.connect(target_ws, max_size=8 * 1024 * 1024) as ws:
+			ws.send(json.dumps({"id": 1, "method": "Page.enable"}))
+			ws.send(json.dumps({"id": 2, "method": "Runtime.enable"}))
+			ws.send(json.dumps({"id": 3, "method": "Network.enable"}))
+			ws.send(json.dumps({"id": 4, "method": "Page.navigate", "params": {"url": home_url}}))
+
+			deadline = time.time() + 15.0
+			while time.time() < deadline:
+				raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+				msg = json.loads(raw)
+				if msg.get("method") == "Page.loadEventFired":
+					break
+			else:
+				raise RuntimeError("CDP 页面加载超时，请确认 Chrome 中 BOSS 直聘可打开")
+
+			ws.send(json.dumps({
+				"id": 5,
+				"method": "Network.getAllCookies",
+			}))
+			all_cookies: dict[str, str] = {}
+			while time.time() < deadline:
+				raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+				msg = json.loads(raw)
+				if msg.get("id") != 5:
+					continue
+				if err := msg.get("error"):
+					raise RuntimeError(f"CDP cookie 提取失败: {err}")
+				for cookie in msg.get("result", {}).get("cookies", []):
+					if cookie_domain in cookie.get("domain", ""):
+						all_cookies[cookie["name"]] = cookie["value"]
+				break
+
+			ws.send(json.dumps({
+				"id": 6,
+				"method": "Runtime.evaluate",
+				"params": {
+					"expression": expression,
+					"returnByValue": True,
+					"awaitPromise": True,
+				},
+			}))
+			runtime_payload: dict[str, Any] = {}
+			while time.time() < deadline:
+				raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+				msg = json.loads(raw)
+				if msg.get("id") != 6:
+					continue
+				if err := msg.get("error"):
+					raise RuntimeError(f"CDP Runtime.evaluate error: {err}")
+				if exc_details := msg.get("result", {}).get("exceptionDetails"):
+					raise RuntimeError(
+						f"JS exception: {exc_details.get('text')} - "
+						f"{exc_details.get('exception', {}).get('description', '')[:300]}"
+					)
+				result = msg.get("result", {}).get("result", {})
+				runtime_payload = result.get("value", {}) if isinstance(result, dict) else {}
+				break
+
+		runtime_cookies = runtime_payload.get("cookies", {}) if isinstance(runtime_payload, dict) else {}
+		if isinstance(runtime_cookies, dict):
+			all_cookies.update({str(k): str(v) for k, v in runtime_cookies.items()})
+		if not all_cookies.get(success_cookie):
+			raise RuntimeError("当前 CDP Chrome 中未检测到已登录会话，请先在该 Chrome 中登录")
+
+		token: dict[str, Any] = {
+			"cookies": all_cookies,
+			"stoken": all_cookies.get("__zp_stoken__", "") if platform == "zhipin" else "",
+			"user_agent": runtime_payload.get("userAgent", "") if isinstance(runtime_payload, dict) else "",
+		}
+		if platform == "zhilian":
+			token["x_zp_client_id"] = ""
+		return token
+	finally:
+		_close_cdp_page(cdp_http_url, target_id)
 
 
 def login_via_browser(*, timeout: int = 120, platform: str = "zhipin") -> dict[str, Any]:
